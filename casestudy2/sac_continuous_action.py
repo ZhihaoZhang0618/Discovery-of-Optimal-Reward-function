@@ -1,8 +1,11 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
+import sys
 import random
 import time
 from dataclasses import dataclass
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import gymnasium as gym
 import numpy as np
@@ -15,6 +18,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 from collections import namedtuple
 from utils.reward_machine import RewardFunction
+
 
 @dataclass
 class Args:
@@ -36,7 +40,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "Reacher-v2"
+    env_id: str = "Reacher-v4"
     """the environment id of the task"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -81,6 +85,9 @@ class Args:
     """the number of samples drawn for reward training"""
     reward_buffer_size: int = 100
     """the size of the reward-specific buffer"""
+
+    reward_mode: str = "learned"
+    """reward source for RL updates: 'learned' (default) or 'env'"""
 
 
 
@@ -174,7 +181,9 @@ class Actor(nn.Module):
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
-        return action, log_prob.sum(1, keepdim=True)
+        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        return action, log_prob
 
 
 if __name__ == "__main__":
@@ -188,7 +197,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
 
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.reward_mode}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -197,7 +206,6 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             entity=args.wandb_entity,
             sync_tensorboard=True,
             config=vars(args),
-            name=run_name,
             monitor_gym=True,
             save_code=True,
         )
@@ -250,40 +258,57 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         n_envs=args.num_envs,
         handle_timeout_termination=False,
     )
-    
     # Reward Setup
-    reward_function = RewardFunction(env=envs, args = args, device = device)
-    Transition = namedtuple('Transition', ['state', 'action', 'reward', 'log_probs', 'mu', 'overline_V'])
+    reward_function = RewardFunction(env=envs, args=args, device=device) if args.reward_mode == "learned" else None
+    Transition = namedtuple("Transition", ["state", "action", "reward", "log_probs", "mu", "overline_V"])
     epidata = []
+
     start_time = time.time()
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            actions = np.array([envs.single_action_space.sample() for _ in range(args.num_envs)])
+            log_prob_t = None
+            mu = None
         else:
-            actions, log_prob, mean, mu = actor.get_action(torch.Tensor(obs).to(device))
-            actions = actions.detach().cpu().numpy()
+            with torch.no_grad():
+                actions_t, log_prob_t, _, mu = actor.get_action(torch.Tensor(obs).to(device))
+            actions = actions_t.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, _, terminations, truncations, infos = envs.step(actions)
-        
-        # reward_orig = rewards
+        next_obs, env_rewards, terminations, truncations, infos = envs.step(actions)
+
         with torch.no_grad():
-            rewards = reward_function.observe_reward(obs[0], actions[0], next_obs)
-            transition = Transition(state=obs[0], action=actions[0], reward=rewards, log_probs=log_prob, mu=mu, overline_V=0.0)
+            rewards = (
+                reward_function.observe_reward(torch.Tensor(obs).to(device), torch.Tensor(actions).to(device), next_obs)
+                if reward_function is not None
+                else np.asarray(env_rewards)
+            )
+
+        if reward_function is not None and log_prob_t is not None:
+            reward_hat0 = float(np.asarray(rewards).reshape(-1)[0])
+            transition = Transition(
+                state=np.asarray(obs[0]),
+                action=np.asarray(actions[0]),
+                reward=reward_hat0,
+                log_probs=float(log_prob_t[0].detach().cpu().item()),
+                mu=mu[1],
+                overline_V=0.0,
+            )
             epidata.append(transition)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
-                if info is not None:
+                if info and "episode" in info:
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    reward_function.D_xi.append(reward_function.store_V(epidata)) 
-                    epidata = []
-                    break
+                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    if reward_function is not None:
+                        reward_function.D_xi.append(reward_function.store_V(epidata))
+                        epidata = []
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -320,7 +345,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
+                    pi, log_pi, _, _ = actor.get_action(data.observations)
                     qf1_pi = qf1(data.observations, pi)
                     qf2_pi = qf2(data.observations, pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
@@ -332,7 +357,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
+                            _, log_pi, _, _ = actor.get_action(data.observations)
                         alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()
@@ -347,7 +372,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                     
-            if global_step % args.reward_frequency == 0:
+            if reward_function is not None and global_step % args.reward_frequency == 0:
                 reward_function.optimize_reward(agent=actor)
 
             if global_step % 100 == 0:

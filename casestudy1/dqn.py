@@ -1,5 +1,9 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/dqn/#dqnpy
 import os
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import random
 import time
 from dataclasses import dataclass
@@ -86,6 +90,9 @@ class Args:
     """the learning rate for the reward model"""
     reward_buffer_size: int = 100
     """the size of the reward-specific buffer"""
+
+    reward_mode: str = "learned"
+    """reward source for RL updates: 'learned' (default) or 'env'"""
     
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -144,7 +151,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
     args = tyro.cli(Args)
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.reward_mode}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -191,7 +198,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     )
     
     # Reward Setup
-    reward_function = RewardFunction(env=envs, args = args, device = device)
+    reward_function = RewardFunction(env=envs, args=args, device=device) if args.reward_mode == "learned" else None
     Transition = namedtuple('Transition', ['state', 'action', 'reward', 'log_probs', 'mu', 'overline_V'])
     epidata = []
     start_time = time.time()
@@ -200,22 +207,35 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
+        q_values = q_network(torch.Tensor(obs).to(device))
+        log_probs = F.log_softmax(q_values, dim=1)
+        mu = q_values.detach().cpu().numpy()
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
         if random.random() < epsilon:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            q_values = q_network(torch.Tensor(obs).to(device))
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
-            log_probs = F.log_softmax(q_values, dim=1)
-            mu = q_values.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, _, terminations, truncations, infos = envs.step(actions)
+        next_obs, env_rewards, terminations, truncations, infos = envs.step(actions)
         
         with torch.no_grad():
-            rewards = reward_function.observe_reward(obs, actions, next_obs)
-            transition = Transition(state=obs, action=actions, reward=rewards, log_probs=log_probs, mu=mu, overline_V=0.0)
-            epidata.append(transition)
+            rewards = (
+                reward_function.observe_reward(obs, actions, next_obs)
+                if reward_function is not None
+                else np.asarray(env_rewards)
+            )
+            if reward_function is not None:
+                reward_hat0 = float(np.asarray(rewards).reshape(-1)[0])
+                transition = Transition(
+                    state=obs[0],
+                    action=int(actions[0]),
+                    reward=reward_hat0,
+                    log_probs=log_probs[0].detach().cpu().numpy(),
+                    mu=mu[0],
+                    overline_V=0.0,
+                )
+                epidata.append(transition)
         
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -224,8 +244,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                    reward_function.D_xi.append(reward_function.store_V(epidata)) 
-                    epidata = []
+                    if reward_function is not None:
+                        reward_function.D_xi.append(reward_function.store_V(epidata))
+                        epidata = []
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -264,7 +285,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     target_network_param.data.copy_(
                         args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                     )
-            if global_step % args.reward_frequency == 0:
+            if reward_function is not None and global_step % args.reward_frequency == 0:
                 reward_function.optimize_reward(agent=q_network)
 
     if args.save_model:

@@ -27,7 +27,20 @@ def get_args():
     
     parser.add_argument("--simulation_time", type=int, default=12 * 30 * 24 * 60, help="Total simulation time (in minutes)")
 
+    parser.add_argument(
+        "--steps_per_month",
+        type=int,
+        default=30 * 24 * 60,
+        help="How many environment steps correspond to one month when computing the month index.",
+    )
+
     return parser.parse_args()
+
+
+def month_from_timestep(env: data_center.Environment, timestep: int, steps_per_month: int) -> int:
+    if steps_per_month <= 0:
+        return int(env.initial_month) % 12
+    return (int(env.initial_month) + (int(timestep) // int(steps_per_month))) % 12
 
 
 
@@ -76,7 +89,11 @@ if __name__ == "__main__":
         energy_ai = abs(action - direction_boundary) * args.temperature_step
 
         
-        next_state, reward, game_over = env.update_env(direction, energy_ai, int(timestep / (30 * 24 * 60)))
+        next_state, reward, game_over = env.update_env(
+            direction,
+            energy_ai,
+            month_from_timestep(env, timestep, args.steps_per_month),
+        )
         
         
         current_state = next_state

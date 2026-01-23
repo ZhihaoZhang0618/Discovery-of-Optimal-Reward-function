@@ -1,8 +1,11 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/td3/#td3_continuous_actionpy
 import os
+import sys
 import random
 import time
 from dataclasses import dataclass
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import gymnasium as gym
 import numpy as np
@@ -10,12 +13,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.distributions.normal as Normal
+from torch.distributions.normal import Normal
 import tyro
 from collections import namedtuple
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 from utils.reward_machine import RewardFunction
+
+import PyFlyt.gym_envs  # noqa: F401
+from PyFlyt.gym_envs import FlattenWaypointEnv
 
 @dataclass
 class Args:
@@ -43,7 +49,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "PyFlyt/QuadX-Waypoints-v3"
+    env_id: str = "PyFlyt/QuadX-Waypoints-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -87,13 +93,22 @@ class Args:
     reward_buffer_size: int = 100
     """the size of the reward-specific buffer"""
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+    reward_mode: str = "learned"
+    """training reward source: `env` or `learned` (metrics always log env episodic_return)"""
+
+    waypoint_context_length: int = 2
+    """PyFlyt waypoint env context length (FlattenWaypointEnv)"""
+
+def make_env(env_id, seed, idx, capture_video, run_name, waypoint_context_length: int):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+        if "Waypoints" in env_id:
+            env = FlattenWaypointEnv(env=env, context_length=waypoint_context_length)
+        env = gym.wrappers.TransformObservation(env, lambda obs: obs.astype(np.float32))
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed)
         return env
@@ -191,7 +206,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
 
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.reward_mode}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -220,7 +235,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name, args.waypoint_context_length) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -246,33 +261,50 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         handle_timeout_termination=False,
     )
     # Reward Setup
-    reward_function = RewardFunction(teacher_name = args.teacher_name, env=envs, args = args, device = device)
+    reward_function = RewardFunction(env=envs, args = args, device = device)
     Transition = namedtuple('Transition', ['state', 'action', 'reward', 'log_probs', 'mu', 'overline_V'])
     epidata = []
     start_time = time.time()
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+    obs = np.asarray(obs, dtype=np.float32)
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
+        log_prob = None
+        mu = None
         if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)], dtype=np.float32)
         else:
             with torch.no_grad():
                 actions, log_prob, mu = actor(torch.Tensor(obs).to(device))
                 actions += torch.normal(0, actor.action_scale * args.exploration_noise)
-                actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
+                actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high).astype(np.float32)
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, _, terminations, truncations, infos = envs.step(actions)
+        next_obs, env_rewards, terminations, truncations, infos = envs.step(actions)
+        next_obs = np.asarray(next_obs, dtype=np.float32)
         with torch.no_grad():
-            rewards = reward_function.observe_reward(obs, actions, next_obs)
-            transition = Transition(state=obs, action=actions, reward=rewards, log_probs=log_prob, mu=mu, overline_V=0.0)
+            rewards_learned = reward_function.observe_reward(obs, actions, next_obs)
+
+        rewards_train = np.asarray(env_rewards).reshape(-1) if args.reward_mode == "env" else np.asarray(rewards_learned).reshape(-1)
+        rewards_train = rewards_train.astype(np.float32, copy=False)
+
+        if mu is not None:
+            transition = Transition(
+                state=np.asarray(obs)[0],
+                action=np.asarray(actions)[0],
+                reward=float(np.asarray(rewards_learned).reshape(-1)[0]),
+                log_probs=float(log_prob.detach().cpu()) if log_prob is not None else 0.0,
+                mu=mu,
+                overline_V=0.0,
+            )
             epidata.append(transition)
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
                 if info is not None:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                    ep_r = float(np.asarray(info["episode"]["r"]).reshape(-1)[0])
+                    print(f"global_step={global_step}, episodic_return={ep_r}")
+                    writer.add_scalar("charts/episodic_return", ep_r, global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                     reward_function.D_xi.append(reward_function.store_V(epidata)) 
                     epidata = []
@@ -283,7 +315,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        rb.add(obs, real_next_obs, actions, rewards_train, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -291,21 +323,31 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
+            observations = data.observations.float()
+            next_observations = data.next_observations.float()
+            actions_batch = data.actions.float()
+            rewards_batch = data.rewards.float()
+            dones_batch = data.dones.float()
             with torch.no_grad():
-                clipped_noise = (torch.randn_like(data.actions, device=device) * args.policy_noise).clamp(
+                clipped_noise = (torch.randn_like(actions_batch, device=device) * args.policy_noise).clamp(
                     -args.noise_clip, args.noise_clip
                 ) * target_actor.action_scale
 
-                next_state_actions = (target_actor(data.next_observations) + clipped_noise).clamp(
-                    envs.single_action_space.low[0], envs.single_action_space.high[0]
-                )
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                target_next_actions = target_actor(
+                    next_observations,
+                    deterministic=True,
+                    with_logprob=False,
+                )[0]
+                action_low = torch.as_tensor(envs.single_action_space.low, device=device, dtype=target_next_actions.dtype)
+                action_high = torch.as_tensor(envs.single_action_space.high, device=device, dtype=target_next_actions.dtype)
+                next_state_actions = (target_next_actions + clipped_noise).clamp(action_low, action_high)
+                qf1_next_target = qf1_target(next_observations, next_state_actions)
+                qf2_next_target = qf2_target(next_observations, next_state_actions)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target)
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+                next_q_value = rewards_batch.flatten() + (1 - dones_batch.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
+            qf1_a_values = qf1(observations, actions_batch).view(-1)
+            qf2_a_values = qf2(observations, actions_batch).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -316,7 +358,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             q_optimizer.step()
 
             if global_step % args.policy_frequency == 0:
-                actor_loss = -qf1(data.observations, actor(data.observations)[0]).mean()
+                actor_actions = actor(observations, deterministic=True, with_logprob=False)[0]
+                actor_loss = -qf1(observations, actor_actions).mean()
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()

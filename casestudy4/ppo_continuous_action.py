@@ -1,8 +1,11 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
 import os
+import sys
 import random
 import time
 from dataclasses import dataclass
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import gymnasium as gym
 import numpy as np
@@ -14,6 +17,9 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from collections import namedtuple
 from utils.reward_machine import RewardFunction
+
+import PyFlyt.gym_envs  # noqa: F401
+from PyFlyt.gym_envs import FlattenWaypointEnv
 
 @dataclass
 class Args:
@@ -41,7 +47,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "PyFlyt/QuadX-Waypoints-v3"
+    env_id: str = "PyFlyt/QuadX-Waypoints-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -100,17 +106,26 @@ class Args:
     """the number of samples drawn for reward training"""
     reward_buffer_size: int = 100
     """the size of the reward-specific buffer"""
+
+    reward_mode: str = "learned"
+    """training reward source: `env` or `learned` (metrics always log env episodic_return)"""
+
+    waypoint_context_length: int = 2
+    """PyFlyt waypoint env context length (FlattenWaypointEnv)"""
     
     
 
-def make_env(env_id, idx, capture_video, run_name, gamma):
+def make_env(env_id, idx, capture_video, run_name, gamma, waypoint_context_length: int):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+        if "Waypoints" in env_id:
+            env = FlattenWaypointEnv(env=env, context_length=waypoint_context_length)
         env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
+        env = gym.wrappers.TransformObservation(env, lambda obs: obs.astype(np.float32))
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
@@ -171,7 +186,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.reward_mode}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -200,7 +215,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
+        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma, args.waypoint_context_length) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -219,7 +234,7 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
+    next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
     next_done = torch.zeros(args.num_envs).to(device)
     
     # Reward Setup
@@ -248,24 +263,38 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, _, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            next_obs, env_rewards, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
-            
-            reward_orig = rewards
+
             with torch.no_grad():
-                reward = reward_function.observe_reward(obs[0], actions[0], next_obs)        
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
-            transition = Transition(state=now_ob, action=action, reward=reward, log_probs=logprob, mu=mu, overline_V=0.0)
-            epidata.append(transition)
+                reward_learned = reward_function.observe_reward(now_ob, action, next_obs)
+            reward_train = np.asarray(env_rewards).reshape(-1) if args.reward_mode == "env" else np.asarray(reward_learned).reshape(-1)
+            rewards[step] = torch.as_tensor(reward_train, device=device, dtype=torch.float32).view(-1)
+
+            next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
+            next_done = torch.as_tensor(next_done, dtype=torch.float32, device=device)
+
+            # reward learning expects single-env transitions
+            if args.num_envs == 1:
+                transition = Transition(
+                    state=now_ob[0].detach().cpu().numpy(),
+                    action=action[0].detach().cpu().numpy(),
+                    reward=float(np.asarray(reward_learned).reshape(-1)[0]),
+                    log_probs=float(logprob[0].detach().cpu()),
+                    mu=mu,
+                    overline_V=0.0,
+                )
+                epidata.append(transition)
             
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                        ep_r = float(np.asarray(info["episode"]["r"]).reshape(-1)[0])
+                        print(f"global_step={global_step}, episodic_return={ep_r}")
+                        writer.add_scalar("charts/episodic_return", ep_r, global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                        reward_function.D_xi.append(reward_function.store_V(epidata)) 
+                        if len(epidata) > 0:
+                            reward_function.D_xi.append(reward_function.store_V(epidata))
                         epidata = []
 
         # bootstrap value if not done

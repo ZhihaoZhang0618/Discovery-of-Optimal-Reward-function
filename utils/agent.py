@@ -3,10 +3,11 @@ for casestudy3
 
 """
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.distributions.categorical as Categorical
+from torch.distributions import Categorical
 import torch.nn.functional as F
 from collections import deque
 import copy
@@ -43,8 +44,10 @@ class Brain(nn.Module):
 class DQN(object):
     def __init__(self, args):
         self.memory = list()
-        self.max_memory = args.ax_memory
-        self.discount = args.discount
+        # casestudy3 train scripts define --max_memory and --gamma.
+        # Keep backward compatibility with older arg names if present.
+        self.max_memory = getattr(args, "max_memory", getattr(args, "ax_memory", 3000))
+        self.discount = getattr(args, "discount", getattr(args, "gamma", 0.99))
 
     def remember(self, transition, game_over):
         self.memory.append([transition, game_over])
@@ -54,6 +57,11 @@ class DQN(object):
     def get_batch(self, model, batch_size = 10):
         len_memory = len(self.memory)
         num_inputs = self.memory[0][0][0].shape[1]
+
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            model_device = torch.device("cpu")
         
         num_outputs = model.number_actions
         inputs = np.zeros((min(len_memory, batch_size), num_inputs))
@@ -61,11 +69,11 @@ class DQN(object):
         for i, idx in enumerate(np.random.randint(0, len_memory, size = min(len_memory, batch_size))):
             current_state, action, reward, next_state = self.memory[idx][0]
             game_over = self.memory[idx][1]
-            current_state_tensor = torch.tensor(current_state, dtype=torch.float32).unsqueeze(0)
-            next_state_tensor = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)
+            current_state_tensor = torch.tensor(current_state, dtype=torch.float32, device=model_device).unsqueeze(0)
+            next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=model_device).unsqueeze(0)
             with torch.no_grad():
-                current_q_values = model(current_state_tensor).squeeze(0).numpy()
-                next_q_values = model(next_state_tensor).squeeze(0).numpy()
+                current_q_values = model(current_state_tensor).squeeze(0).detach().cpu().numpy()
+                next_q_values = model(next_state_tensor).squeeze(0).detach().cpu().numpy()
             inputs[i] = current_state
             targets[i] = current_q_values
 
@@ -203,6 +211,7 @@ class PPO_agent():
 
 
     def save(self):
+        os.makedirs("./model", exist_ok=True)
         torch.save(self.critic.state_dict(), "./model/ppo+_critic.pth")
         torch.save(self.actor.state_dict(), "./model/ppo+_actor.pth")
 
@@ -231,19 +240,48 @@ class Policy_Net(nn.Module):
         return probs
 
 class SACD_agent():
-    def __init__(self, state_dim, action_dim, hid_shape, gamma, alpha, batch_size, adaptive_alpha, lr, dvc):
-        self.state_dim=state_dim
-        self.action_dim=action_dim
-        self.hid_shape=hid_shape
-        self.gamma=gamma
-        self.alpha=alpha
-        self.batch_size=batch_size
-        self.adaptive_alpha=adaptive_alpha
-        self.lr=lr
-        self.dvc=dvc
+    def __init__(
+        self,
+        state_dim,
+        action_dim=None,
+        hid_shape=None,
+        gamma=None,
+        alpha=None,
+        batch_size=None,
+        adaptive_alpha=None,
+        lr=None,
+        dvc=None,
+    ):
+        # casestudy3 calls: SACD_agent(args, device)
+        rb_max_size = int(1e6)
+        if action_dim is not None and dvc is None and hasattr(state_dim, "state_dim") and isinstance(action_dim, torch.device):
+            args = state_dim
+            dvc = action_dim
+            state_dim = args.state_dim
+            action_dim = args.action_dim
+            hid_shape = tuple(getattr(args, "hid_shape", (64, 64)))
+            gamma = args.gamma
+            alpha = args.alpha
+            batch_size = args.batch_size
+            adaptive_alpha = args.adaptive_alpha
+            lr = args.lr
+            rb_max_size = int(getattr(args, "max_memory", rb_max_size))
+
+        if dvc is None:
+            raise TypeError("SACD_agent requires a device (dvc).")
+
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.hid_shape = hid_shape
+        self.gamma = gamma
+        self.alpha = alpha
+        self.batch_size = batch_size
+        self.adaptive_alpha = adaptive_alpha
+        self.lr = lr
+        self.dvc = dvc
         self.tau = 0.005
         self.H_mean = 0
-        self.replay_buffer = ReplayBuffer(self.state_dim, self.dvc, max_size=int(1e6))
+        self.replay_buffer = ReplayBuffer(self.state_dim, self.dvc, max_size=rb_max_size)
 
         self.actor = Policy_Net(self.state_dim, self.action_dim, self.hid_shape).to(self.dvc)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.lr)
@@ -322,7 +360,8 @@ class SACD_agent():
         for param, target_param in zip(self.q_critic.parameters(), self.q_critic_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-    def save(self, teacher):
+    def save(self, teacher=None):
+        os.makedirs("./model", exist_ok=True)
         torch.save(self.actor.state_dict(), f"./model/SAC+_actor.pth")
         torch.save(self.q_critic.state_dict(), f"./model/SAC+_critic.pth")
 

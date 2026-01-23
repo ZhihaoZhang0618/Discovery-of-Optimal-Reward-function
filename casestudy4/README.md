@@ -50,8 +50,8 @@ The official documentation for gymnasium environments is in [here](https://jjsho
 
 ### Experiment
 
-The task used for RL is `QuadX-Waypoints-v3`, run the follwing code in `terminal`:
+The task used for RL is `QuadX-Waypoints-v4` (v3 is deprecated in newer PyFlyt/Gymnasium combos), run the following code in `terminal`:
 
 ```
-python sac_continuous_action.py --env_id PyFlyt/QuadX-Waypoints-v3 --total_timesteps 1000000 
+python sac_continuous_action.py --env_id PyFlyt/QuadX-Waypoints-v4 --total_timesteps 1000000 
 ```

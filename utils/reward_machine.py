@@ -1,11 +1,10 @@
-import torch
-import torch.nn as nn
-import os
 import numpy as np
-from torch.autograd import Variable
-from reward_model import Critic, Reward
+import random
+import torch
 import torch.optim as optim
 from collections import deque
+
+from .reward_model import Critic, Reward
 
 
 class RewardFunction():
@@ -31,8 +30,45 @@ class RewardFunction():
         self.activate_function = activation_function_list[args.activate_function]
         self.last_activate_function = activation_function_list[args.last_activate_function]
         self.device = device
-        self.state_dim = env.observation_space.shape
-        self.action_dim = env.action_space.shape
+
+        obs_space = getattr(env, "single_observation_space", None) or getattr(env, "observation_space", None)
+        act_space = getattr(env, "single_action_space", None) or getattr(env, "action_space", None)
+        self.obs_space = obs_space
+        self.act_space = act_space
+
+        if obs_space is not None:
+            self.state_dim = int(np.prod(obs_space.shape))
+        else:
+            # Fallback for non-Gym custom envs (e.g., casestudy3 data center)
+            if not hasattr(args, "state_dim"):
+                raise ValueError("env has no observation_space; please provide args.state_dim")
+            self.state_dim = int(args.state_dim)
+
+        # Action encoding
+        if act_space is not None:
+            if hasattr(act_space, "n"):
+                # Discrete
+                self.is_discrete = True
+                self.n_actions = int(act_space.n)
+                self.action_dim = self.n_actions
+            else:
+                # Continuous Box
+                self.is_discrete = False
+                self.n_actions = None
+                self.action_dim = int(np.prod(act_space.shape))
+        else:
+            # Fallback: assume discrete actions with size from args
+            n_actions = None
+            if hasattr(args, "action_dim"):
+                n_actions = int(args.action_dim)
+            elif hasattr(args, "number_actions"):
+                n_actions = int(args.number_actions)
+            if not n_actions or n_actions <= 0:
+                raise ValueError("env has no action_space; please provide args.action_dim (discrete) or use a Gym env")
+            self.is_discrete = True
+            self.n_actions = n_actions
+            self.action_dim = n_actions
+
         # Value function V(s) used to approximate standard state values
         self.value_function = Critic(layer_num=3, input_dim=self.state_dim, output_dim=1,\
                                     hidden_dim=self.hidden_dim,
@@ -47,9 +83,56 @@ class RewardFunction():
                                     .to(self.device)
         self.reward_function_optimizer = optim.Adam(self.reward_function.parameters(), lr=self.lr)
         self.D_xi = deque(maxlen=args.reward_buffer_size) # Trajectory buffer
-        self.n_samples = args.n_samples # Number of sampled actions for estimating action set
 
-    def ovserve_reward(self, state, action, next_state=None):
+        # Number of sampled actions for estimating action set (continuous only)
+        self.n_samples = int(getattr(args, "n_samples", 10))
+
+    def _to_state_tensor(self, state):
+        if isinstance(state, torch.Tensor):
+            state_t = state
+        else:
+            state_t = torch.as_tensor(state)
+        state_t = state_t.to(self.device, dtype=torch.float32)
+        state_t = state_t.view(-1, self.state_dim)
+        return state_t
+
+    def _encode_action(self, action, batch_size: int | None = None):
+        if isinstance(action, torch.Tensor):
+            action_t = action
+        else:
+            action_t = torch.as_tensor(action)
+
+        if self.is_discrete:
+            action_t = action_t.to(self.device)
+            action_t = action_t.view(-1).long()
+            return torch.nn.functional.one_hot(action_t, num_classes=self.n_actions).to(dtype=torch.float32)
+
+        action_t = action_t.to(self.device, dtype=torch.float32)
+        action_t = action_t.view(-1, self.action_dim)
+        return action_t
+
+    def _get_action_probs(self, mu):
+        # mu can be a Categorical distribution or raw logits/q-values
+        if hasattr(mu, "probs"):
+            probs = mu.probs
+            return probs.to(self.device, dtype=torch.float32).view(-1)
+
+        vec = mu
+        if not isinstance(vec, torch.Tensor):
+            vec = torch.as_tensor(vec, device=self.device, dtype=torch.float32)
+        else:
+            vec = vec.to(self.device, dtype=torch.float32)
+        vec = vec.view(-1)
+
+        # Heuristic: if it already looks like probabilities, normalize gently.
+        if torch.all(vec >= 0) and torch.all(vec <= 1.0 + 1e-3) and torch.isfinite(vec).all():
+            s = vec.sum()
+            if torch.isfinite(s) and (s > 0.99) and (s < 1.01):
+                return vec / s
+
+        return torch.softmax(vec, dim=0)
+
+    def observe_reward(self, state, action, next_state=None):
         """
         Give the current reward function on a given state-action pair
         Args:
@@ -60,44 +143,74 @@ class RewardFunction():
         Returns:
             Reward signal for the state-action pair
         """
-        state = torch.Tensor(state).to(self.device)
-        action = torch.Tensor(action).to(self.device)
-        reward = self.reward_function.forward(state, action).detach().cpu().numpy()
+        state_t = self._to_state_tensor(state)
+        action_t = self._encode_action(action)
+        reward = self.reward_function.forward(state_t, action_t).detach().cpu().numpy().squeeze(-1)
         return reward
+
+    # Backward-compatible typo
+    def ovserve_reward(self, state, action, next_state=None):
+        return self.observe_reward(state, action, next_state=next_state)
 
     def optimize_reward(self, agent):
         """
         Perform the upper-level optimization step to update the reward function
         
         """
-        # decompose trajectories in D into individual transitions
-        D_new = [step for traj in self.D_xi for step in traj]
-        np.random.shuffle(D_new)
+        if len(self.D_xi) == 0:
+            return
+
+        # Decompose trajectories into transitions
+        transitions = [step for traj in self.D_xi for step in traj]
+        if len(transitions) == 0:
+            return
+
+        # Keep optimization cost bounded.
+        max_transitions = 2048
+        if len(transitions) > max_transitions:
+            transitions = random.sample(transitions, k=max_transitions)
+        else:
+            np.random.shuffle(transitions)
+
         states_batch, overline_V_batch = [], []
-        accumulator_1, accumulator_2 = [], []
-        for step in D_new: 
-            s, a, reward_hat, log_probs, mu, overline_V = step # tau
-            states_batch.append(s)
-            overline_V_batch.append(overline_V)
-            # compute π(a|s) using the policy distribution
-            prob_a = torch.exp(log_probs).to(self.device)
-            # estimate state value V(s)
-            V_s = self.value_function(torch.Tensor(s).to(self.device)).detach().cpu().item()
-            # compute the first term of the gradient
-            accumulator_2.append(prob_a * (overline_V - V_s))
-            # sample actions from action space
-            action_bs, log_probs_action_bs = agent.get_action_prob_from_mu(mu, self.n_samples)
-            # compute reward for sampled actions
-            s_expanded = torch.tensor(np.tile(s, (self.n_samples, 1)), dtype=torch.float32, device=self.device)
-            reward_bs = self.reward_function(s_expanded, action_bs)
-            # estimate the reward center
-            probs_action_bs = torch.exp(log_probs_action_bs)
-            reward_center = torch.sum(probs_action_bs * reward_bs, dim=0)
-            # compute the second term of the gradient
-            accumulator_1.append(torch.Tensor(reward_hat).to(self.device) - reward_center)
-        self.optimize_value_function(np.array(states_batch), np.array(overline_V_batch))
-        loss = torch.mean(torch.stack(accumulator_2)) * torch.mean(torch.stack(accumulator_1))
-        # update the reward function
+        losses = []
+
+        for step in transitions:
+            s, a, reward_hat, _log_probs, mu, overline_V = step
+
+            state_t = self._to_state_tensor(s)  # [1, state_dim]
+            V_s = self.value_function(state_t).detach().view(())
+            overline_V_t = torch.as_tensor(overline_V, device=self.device, dtype=torch.float32).view(())
+
+            if self.is_discrete:
+                probs = self._get_action_probs(mu)  # [n_actions]
+                all_actions = torch.eye(self.n_actions, device=self.device, dtype=torch.float32)
+                state_rep = state_t.repeat(self.n_actions, 1)
+                r_all = self.reward_function(state_rep, all_actions).squeeze(-1)  # [n_actions]
+                reward_center = (probs * r_all).sum()
+                a_idx = int(a)
+                pi_a = probs[a_idx].detach()
+            else:
+                # Continuous: approximate with samples from the current policy (requires agent helper)
+                action_bs, log_probs_action_bs = agent.get_action_prob_from_mu(mu, self.n_samples)
+                action_enc = self._encode_action(action_bs)
+                state_rep = state_t.repeat(action_enc.shape[0], 1)
+                reward_bs = self.reward_function(state_rep, action_enc).squeeze(-1)
+                probs_bs = torch.exp(log_probs_action_bs.to(self.device, dtype=torch.float32)).view(-1)
+                reward_center = (probs_bs * reward_bs).sum()
+                pi_a = torch.tensor(1.0, device=self.device)
+
+            reward_hat_t = torch.as_tensor(reward_hat, device=self.device, dtype=torch.float32).view(())
+            term1 = reward_hat_t - reward_center
+            term2 = pi_a * (overline_V_t - V_s)
+            losses.append(term2 * term1)
+
+            states_batch.append(np.asarray(s))
+            overline_V_batch.append(float(overline_V))
+
+        self.optimize_value_function(np.asarray(states_batch), np.asarray(overline_V_batch))
+
+        loss = torch.mean(torch.stack(losses))
         self.reward_function_optimizer.zero_grad()
         loss.backward()
         self.reward_function_optimizer.step()
@@ -108,10 +221,10 @@ class RewardFunction():
         
         """
         # array --> tensor
-        states_batch = torch.Tensor(states_batch).to(self.device)
-        overline_V_batch = torch.Tensor(overline_V_batch).to(self.device)
-        pred_batch = self.value_function.forward(states_batch) # [B, 1]
-        loss = torch.nn.functional.smooth_l1_loss(pred_batch, overline_V_batch.unsqueeze(1))
+        states_batch = torch.as_tensor(states_batch, device=self.device, dtype=torch.float32)
+        overline_V_batch = torch.as_tensor(overline_V_batch, device=self.device, dtype=torch.float32)
+        pred_batch = self.value_function.forward(states_batch)
+        loss = torch.nn.functional.smooth_l1_loss(pred_batch.view(-1), overline_V_batch.view(-1))
         self.value_function_optimizer.zero_grad()
         loss.backward()
         self.value_function_optimizer.step()
@@ -127,6 +240,7 @@ class RewardFunction():
             A new list of steps with computed overline_V added to each step.
         """
         new_epidata = []
+        overline_V = 0.0
         for step in reversed(epidata):
             overline_V = step.reward + self.gamma * overline_V
             updated_step = step._replace(overline_V=overline_V)
