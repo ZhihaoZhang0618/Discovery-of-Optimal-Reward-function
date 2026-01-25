@@ -23,6 +23,12 @@ if [[ "${NO_CUDA:-0}" == "1" ]]; then
   NO_CUDA_FLAG="--no-cuda"
 fi
 
+CUDA_PREFIX=""
+if [[ "${NO_CUDA:-0}" == "1" ]]; then
+  # casestudy3 scripts don't accept --no-cuda; force CPU by hiding GPUs.
+  CUDA_PREFIX="CUDA_VISIBLE_DEVICES=''"
+fi
+
 PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
 LOG_DIR="${LOG_DIR:-logs}"
 mkdir -p "$LOG_DIR"
@@ -68,13 +74,13 @@ run_case3() {
       for algo in $algos_str; do
         case "$algo" in
           dqn)
-            cmds+=("python casestudy3/dqn_train.py --reward_mode '$mode' --number_epochs '$epochs' --max_steps '$max_steps' --steps_per_month '$steps_per_month' --seed '$seed' >'$LOG_DIR/case3_dqn_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("$CUDA_PREFIX python casestudy3/dqn_train.py --reward_mode '$mode' --number_epochs '$epochs' --max_steps '$max_steps' --steps_per_month '$steps_per_month' --seed '$seed' >'$LOG_DIR/case3_dqn_${mode}_seed${seed}.log' 2>&1")
             ;;
           ppo)
-            cmds+=("python casestudy3/ppo_train.py --reward_mode '$mode' --number_epochs '$epochs' --max_steps '$max_steps' --steps_per_month '$steps_per_month' --seed '$seed' >'$LOG_DIR/case3_ppo_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("$CUDA_PREFIX python casestudy3/ppo_train.py --reward_mode '$mode' --number_epochs '$epochs' --max_steps '$max_steps' --steps_per_month '$steps_per_month' --seed '$seed' >'$LOG_DIR/case3_ppo_${mode}_seed${seed}.log' 2>&1")
             ;;
           sac)
-            cmds+=("python casestudy3/sac_train.py --reward_mode '$mode' --number_epochs '$epochs' --max_steps '$max_steps' --steps_per_month '$steps_per_month' --seed '$seed' >'$LOG_DIR/case3_sac_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("$CUDA_PREFIX python casestudy3/sac_train.py --reward_mode '$mode' --number_epochs '$epochs' --max_steps '$max_steps' --steps_per_month '$steps_per_month' --seed '$seed' >'$LOG_DIR/case3_sac_${mode}_seed${seed}.log' 2>&1")
             ;;
           *)
             echo "Unknown CASE3_ALGOS entry: $algo" >&2
@@ -89,6 +95,12 @@ run_case3() {
 
 run_case1() {
   local timesteps="${CASE1_TIMESTEPS:-200000}"
+  local reward_frequency="${CASE1_REWARD_FREQUENCY:-}"
+
+  local reward_frequency_flag=""
+  if [[ -n "${reward_frequency}" ]]; then
+    reward_frequency_flag="--reward-frequency '${reward_frequency}'"
+  fi
 
   local seeds_str="${CASE1_SEEDS:-1 2 3 4 5}"
   local modes_str="${CASE1_MODES:-env learned}"
@@ -103,10 +115,10 @@ run_case1() {
       for algo in $algos_str; do
         case "$algo" in
           dqn)
-            cmds+=("python casestudy1/dqn.py --env-id CartPole-v1 --total-timesteps '$timesteps' $NO_CUDA_FLAG --seed '$seed' --reward-mode '$mode' >'$LOG_DIR/case1_dqn_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("python casestudy1/dqn.py --env-id CartPole-v1 --total-timesteps '$timesteps' $NO_CUDA_FLAG --seed '$seed' --reward-mode '$mode' ${reward_frequency_flag} >'$LOG_DIR/case1_dqn_${mode}_seed${seed}.log' 2>&1")
             ;;
           ppo)
-            cmds+=("python casestudy1/ppo.py --env-id CartPole-v1 --total-timesteps '$timesteps' $NO_CUDA_FLAG --seed '$seed' --num-envs 1 --num-steps 128 --reward-mode '$mode' >'$LOG_DIR/case1_ppo_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("python casestudy1/ppo.py --env-id CartPole-v1 --total-timesteps '$timesteps' $NO_CUDA_FLAG --seed '$seed' --num-envs 1 --num-steps 128 --reward-mode '$mode' ${reward_frequency_flag} >'$LOG_DIR/case1_ppo_${mode}_seed${seed}.log' 2>&1")
             ;;
           *)
             echo "Unknown CASE1_ALGOS entry: $algo" >&2
@@ -123,6 +135,12 @@ run_case2() {
   # Reacher-v4 is much slower than CartPole; adjust timesteps as needed.
   local ppo_timesteps="${CASE2_PPO_TIMESTEPS:-200000}"
   local sac_timesteps="${CASE2_SAC_TIMESTEPS:-200000}"
+  local reward_frequency="${CASE2_REWARD_FREQUENCY:-}"
+
+  local reward_frequency_flag=""
+  if [[ -n "${reward_frequency}" ]]; then
+    reward_frequency_flag="--reward-frequency '${reward_frequency}'"
+  fi
 
   local seeds_str="${CASE2_SEEDS:-1 2 3 4 5}"
   local modes_str="${CASE2_MODES:-env learned}"
@@ -137,10 +155,10 @@ run_case2() {
       for algo in $algos_str; do
         case "$algo" in
           ppo)
-            cmds+=("python casestudy2/ppo_continuous_action.py --env-id Reacher-v4 --total-timesteps '$ppo_timesteps' $NO_CUDA_FLAG --seed '$seed' --num-envs 1 --reward-mode '$mode' >'$LOG_DIR/case2_ppo_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("python casestudy2/ppo_continuous_action.py --env-id Reacher-v4 --total-timesteps '$ppo_timesteps' $NO_CUDA_FLAG --seed '$seed' --num-envs 1 --reward-mode '$mode' ${reward_frequency_flag} >'$LOG_DIR/case2_ppo_${mode}_seed${seed}.log' 2>&1")
             ;;
           sac)
-            cmds+=("python casestudy2/sac_continuous_action.py --env-id Reacher-v4 --total-timesteps '$sac_timesteps' $NO_CUDA_FLAG --seed '$seed' --learning-starts 1000 --reward-mode '$mode' >'$LOG_DIR/case2_sac_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("python casestudy2/sac_continuous_action.py --env-id Reacher-v4 --total-timesteps '$sac_timesteps' $NO_CUDA_FLAG --seed '$seed' --learning-starts 1000 --reward-mode '$mode' ${reward_frequency_flag} >'$LOG_DIR/case2_sac_${mode}_seed${seed}.log' 2>&1")
             ;;
           *)
             echo "Unknown CASE2_ALGOS entry: $algo" >&2
@@ -158,6 +176,12 @@ run_case4() {
   local ppo_timesteps="${CASE4_PPO_TIMESTEPS:-200000}"
   local sac_timesteps="${CASE4_SAC_TIMESTEPS:-200000}"
   local td3_timesteps="${CASE4_TD3_TIMESTEPS:-200000}"
+  local reward_frequency="${CASE4_REWARD_FREQUENCY:-}"
+
+  local reward_frequency_flag=""
+  if [[ -n "${reward_frequency}" ]]; then
+    reward_frequency_flag="--reward-frequency '${reward_frequency}'"
+  fi
 
   local seeds_str="${CASE4_SEEDS:-1 2 3 4 5}"
   local modes_str="${CASE4_MODES:-env learned}"
@@ -172,13 +196,13 @@ run_case4() {
       for algo in $algos_str; do
         case "$algo" in
           ppo)
-            cmds+=("python casestudy4/ppo_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps '$ppo_timesteps' $NO_CUDA_FLAG --seed '$seed' --num-envs 1 --num-steps 128 --reward-mode '$mode' >'$LOG_DIR/case4_ppo_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("python casestudy4/ppo_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps '$ppo_timesteps' $NO_CUDA_FLAG --seed '$seed' --num-envs 1 --num-steps 128 --reward-mode '$mode' ${reward_frequency_flag} >'$LOG_DIR/case4_ppo_${mode}_seed${seed}.log' 2>&1")
             ;;
           sac)
-            cmds+=("python casestudy4/sac_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps '$sac_timesteps' $NO_CUDA_FLAG --seed '$seed' --learning-starts 1000 --reward-mode '$mode' >'$LOG_DIR/case4_sac_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("python casestudy4/sac_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps '$sac_timesteps' $NO_CUDA_FLAG --seed '$seed' --learning-starts 1000 --reward-mode '$mode' ${reward_frequency_flag} >'$LOG_DIR/case4_sac_${mode}_seed${seed}.log' 2>&1")
             ;;
           td3)
-            cmds+=("python casestudy4/td3_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps '$td3_timesteps' $NO_CUDA_FLAG --seed '$seed' --learning-starts 1000 --reward-mode '$mode' >'$LOG_DIR/case4_td3_${mode}_seed${seed}.log' 2>&1")
+            cmds+=("python casestudy4/td3_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps '$td3_timesteps' $NO_CUDA_FLAG --seed '$seed' --learning-starts 1000 --reward-mode '$mode' ${reward_frequency_flag} >'$LOG_DIR/case4_td3_${mode}_seed${seed}.log' 2>&1")
             ;;
           *)
             echo "Unknown CASE4_ALGOS entry: $algo" >&2

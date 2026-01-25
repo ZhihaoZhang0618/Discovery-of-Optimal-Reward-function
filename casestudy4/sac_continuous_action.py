@@ -177,19 +177,33 @@ class Actor(nn.Module):
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
-        mu = [log_prob.sum(1, keepdim=True), normal, x_t, y_t]
+        # Store a detached policy distribution for reward learning.
+        # Reward-learning optimizes the reward model, not the actor; keeping a live
+        # autograd graph here can break when the actor updates in-place.
+        mu = [
+            log_prob.sum(1, keepdim=True).detach(),
+            torch.distributions.Normal(mean.detach(), std.detach()),
+        ]
         # Enforcing Action Bound
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean, mu
 
-    def get_action_prob_from_mu(self, normal, N):
-        x_t = normal.rsample((N,)).squeeze(1)   # for reparameterization trick (mean + std * N(0,1))
+    def get_action_prob_from_mu(self, mu, N):
+        # Reward learning stores policy outputs as a small container.
+        # In this SAC implementation, `mu` is a list: [log_prob_sum, normal, x_t, y_t].
+        normal = mu[1] if isinstance(mu, (list, tuple)) else mu
+        x_t = normal.rsample((N,))  # (N, batch, action_dim)
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(x_t)
-        return action, log_prob.sum(1, keepdim=True)
+        log_prob = normal.log_prob(x_t).sum(dim=-1, keepdim=True)
+
+        # Most reward-learning usage here is single-env (batch=1); keep legacy shapes.
+        if action.ndim == 3 and action.shape[1] == 1:
+            action = action.squeeze(1)
+            log_prob = log_prob.squeeze(1)
+        return action, log_prob
 
 
 if __name__ == "__main__":
@@ -302,7 +316,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
 
         # Reward learning needs policy outputs; only collect after learning starts.
-        if mu is not None:
+        # Only collect trajectories when actually training on learned rewards.
+        if args.reward_mode == "learned" and mu is not None:
             transition = Transition(
                 state=np.asarray(obs)[0],
                 action=np.asarray(actions)[0],
@@ -320,8 +335,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     ep_r = float(np.asarray(info["episode"]["r"]).reshape(-1)[0])
                     print(f"global_step={global_step}, episodic_return={ep_r}")
                     writer.add_scalar("charts/episodic_return", ep_r, global_step)
-                    reward_function.D_xi.append(reward_function.store_V(epidata)) 
-                    epidata = []
+                    if args.reward_mode == "learned":
+                        reward_function.D_xi.append(reward_function.store_V(epidata))
+                        epidata = []
                     break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
@@ -391,7 +407,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                     
-            if global_step % args.reward_frequency == 0:
+            if args.reward_mode == "learned" and global_step % args.reward_frequency == 0:
                 reward_function.optimize_reward(agent=actor)
 
             if global_step % 100 == 0:

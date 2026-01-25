@@ -351,7 +351,8 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
         
-        if reward_function is not None:
+        # Reward-learning update can be expensive; run it periodically.
+        if reward_function is not None and (global_step % args.reward_frequency == 0):
             reward_function.optimize_reward(agent)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes

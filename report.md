@@ -30,6 +30,19 @@
     - `python -m pip install -U --pre --index-url https://download.pytorch.org/whl/nightly/cu128 torch torchvision torchaudio`
     - 当前版本：`torch==2.11.0.dev20260116+cu128`（会偏离仓库 pinned 依赖）。
 
+### 2.1 GPU 是否“值得用”（casestudy3/4 的经验结论）
+
+对 casestudy3/4 做了小规模 wall-time 对比（同一机器，同一脚本，仅切换 CUDA 可见性/`--no-cuda`）：
+
+- casestudy3（SAC，`number_epochs=2,max_steps=2000`）：
+  - CUDA 可用：约 3.77s
+  - 强制 CPU（`CUDA_VISIBLE_DEVICES=''`）：约 1.90s
+- casestudy4（PPO，`total_timesteps=5000`）：
+  - CUDA 可用：约 58.17s
+  - `--no-cuda`：约 51.38s
+
+结论：这两类任务更偏 **环境/仿真 CPU-bound + 网络较小**，GPU 往往收益不明显甚至更慢。更实用的加速方式是 **禁用 CUDA + 提高并行进程数（PARALLEL_JOBS）**。
+
 ## 3. 口径与公平性（防“trick”原则）
 
 - **统一评估指标**：比较使用环境 episodic return（`charts/episodic_return`），而不是 learned reward 自己的数。
@@ -38,56 +51,47 @@
 
 重要说明（逻辑一致性）：2026-01-18 我修复了一个会影响 `reward_mode=learned` 结论的实现问题：用于上层 reward-learning 的轨迹缓冲 `epidata`/`store_V` 在部分脚本中曾误存了环境奖励而非 learned reward（导致 reward-learning 目标与 RL 更新不一致）。因此，修复前跑出的 case1/case2 “longer”结果只能作为参考；若要严格对照论文，需要在修复后重新跑同配置。
 
+另外：2026-01-25 又修复了 casestudy1 PPO learned 训练会“越跑越慢/被手动中断”的问题（reward-learning 更新频率过高导致 CPU-bound），并在修复后重新跑了 case1/2 的 100k 单 seed 对比；本报告的 case1/2 结果以该批次为准。
+
 ## 4. 复现进度与结果（Smoke runs）
 
 ### 4.1 Casestudy1：CartPole-v1（离散控制）
 
-运行命令（CPU、seed=1、50k steps）：
+本节结果已用 **修复后的实现重新覆盖**（旧的 50k/200k multi-seed 结果受 bug 影响，不再引用）。
 
-- DQN env：`python casestudy1/dqn.py --env-id CartPole-v1 --total-timesteps 50000 --no-cuda --seed 1 --reward-mode env`
-- DQN learned：`python casestudy1/dqn.py --env-id CartPole-v1 --total-timesteps 50000 --no-cuda --seed 1 --reward-mode learned`
-- PPO env：`python casestudy1/ppo.py --env-id CartPole-v1 --total-timesteps 50000 --no-cuda --seed 1 --num-envs 1 --num-steps 128 --reward-mode env`
-- PPO learned：`python casestudy1/ppo.py --env-id CartPole-v1 --total-timesteps 50000 --no-cuda --seed 1 --num-envs 1 --num-steps 128 --reward-mode learned`
+运行配置（2026-01-25，CPU，seed=114514，100k steps）：
 
-对比指标：TensorBoard scalar `charts/episodic_return`。
+- DQN env：`python casestudy1/dqn.py --env-id CartPole-v1 --total-timesteps 100000 --no-cuda --seed 114514 --reward-mode env --reward-frequency 5000`
+- DQN learned：`python casestudy1/dqn.py --env-id CartPole-v1 --total-timesteps 100000 --no-cuda --seed 114514 --reward-mode learned --reward-frequency 5000`
+- PPO env：`python casestudy1/ppo.py --env-id CartPole-v1 --total-timesteps 100000 --no-cuda --seed 114514 --num-envs 1 --num-steps 128 --reward-mode env --reward-frequency 5000`
+- PPO learned：`python casestudy1/ppo.py --env-id CartPole-v1 --total-timesteps 100000 --no-cuda --seed 114514 --num-envs 1 --num-steps 128 --reward-mode learned --reward-frequency 5000`
 
-结果汇总（CartPole-v1, 50k steps, seed=1）：
+对比指标：TensorBoard scalar `charts/episodic_return`（环境真实回报）。
 
-| 算法 | reward_mode | mean(last 20 episodes) | max episodic return |
+结果汇总（CartPole-v1, 100k, seed=114514；统计 `mean(last 100 episodes)`）：
+
+| 算法 | reward_mode | mean(last 100 episodes) | max episodic return |
 |---|---|---:|---:|
-| DQN | env | 217.70 | 500 |
-| DQN | learned | 184.45 | 500 |
-| PPO | env | 209.15 | 500 |
-| PPO | learned | 265.30 | 500 |
+| DQN | env | 292.55 | 500 |
+| DQN | learned | 287.42 | 500 |
+| PPO | env | 420.26 | 500 |
+| PPO | learned | 500.00 | 500 |
 
-运行目录：
+运行目录（TensorBoard）：
 
-- `runs/CartPole-v1__dqn__env__1__1768633906`
-- `runs/CartPole-v1__dqn__learned__1__1768633933`
-- `runs/CartPole-v1__ppo__env__1__1768633999`
-- `runs/CartPole-v1__ppo__learned__1__1768634035`
+- `runs/CartPole-v1__dqn__env__114514__1769277753`
+- `runs/CartPole-v1__dqn__learned__114514__1769277789`
+- `runs/CartPole-v1__ppo__env__114514__1769277484`
+- `runs/CartPole-v1__ppo__learned__114514__1769277547`
 
-简单解读（单 seed 短跑，仅供参考）：PPO 的 learned reward 在 mean(last20) 上更高；DQN 的 learned reward 更低。
+日志目录（stdout/trace）：
 
-多 seed 统计（CartPole-v1, 50k steps, seeds=1–5；统计对象为每个 run 的 mean(last 20 episodes)）：
+- `logs/smoke_20260125_seed114514_100k/`
 
-| 算法 | reward_mode | mean over seeds | std over seeds | max episodic return (any seed) |
-|---|---|---:|---:|---:|
-| DQN | env | 220.650 | 53.231 | 500 |
-| DQN | learned | 239.530 | 84.352 | 500 |
-| PPO | env | 257.590 | 57.161 | 500 |
-| PPO | learned | 211.680 | 38.562 | 500 |
+简要解读（单 seed）：
 
-进一步的 longer multi-seed（CartPole-v1, 200k steps, seeds=1–5；统计对象为每个 run 的 mean(last 100 episodes)，默认启用 CUDA）：
-
-| 算法 | reward_mode | mean over seeds | std over seeds | max episodic return (any seed) |
-|---|---|---:|---:|---:|
-| DQN | env | 467.470 | 35.441 | 500 |
-| DQN | learned | 398.902 | 118.953 | 500 |
-| PPO | env | 496.468 | 6.826 | 500 |
-| PPO | learned | 261.034 | 48.546 | 500 |
-
-简单解读（longer 版本更可信）：在本仓库实现与默认超参下，CartPole 上 `reward_mode=learned` 并没有稳定优于 `reward_mode=env`；尤其 PPO 的 learned reward 表现显著更差且方差更大。
+- PPO：learned reward 达到稳定解（500），明显优于 env（mean_last100≈420）。
+- DQN：env 与 learned 很接近，env 略高。
 
 ### 4.2 Casestudy2：Reacher-v4（MuJoCo 连续控制）
 
@@ -99,222 +103,131 @@
 - 快速检查：
   - `python -c "import gymnasium as gym; env=gym.make('Reacher-v4'); env.reset(seed=0); env.step(env.action_space.sample()); print('ok'); env.close()"`
 
-PPO（8192 steps，CPU）：
 
-- env：`python casestudy2/ppo_continuous_action.py --env-id Reacher-v4 --total-timesteps 8192 --num-envs 1 --no-cuda --reward-mode env`
-- learned：`python casestudy2/ppo_continuous_action.py --env-id Reacher-v4 --total-timesteps 8192 --num-envs 1 --no-cuda --reward-mode learned`
+本节结果同样以 **修复后的实现重新覆盖**（旧的短跑/多 seed/longer 结果不再引用）。
 
-| 算法 | reward_mode | mean(last 20 episodes) | max episodic return |
-|---|---|---:|---:|
-| PPO | env | -59.00 | -47.09 |
-| PPO | learned | -62.19 | -46.64 |
+运行配置（2026-01-25，CPU，seed=114514，PPO=100k, SAC=100k）：
 
-运行目录：
+- PPO env：`python casestudy2/ppo_continuous_action.py --env-id Reacher-v4 --total-timesteps 100000 --num-envs 1 --no-cuda --seed 114514 --reward-mode env --reward-frequency 5000`
+- PPO learned：`python casestudy2/ppo_continuous_action.py --env-id Reacher-v4 --total-timesteps 100000 --num-envs 1 --no-cuda --seed 114514 --reward-mode learned --reward-frequency 5000`
+- SAC env：`python casestudy2/sac_continuous_action.py --env-id Reacher-v4 --total-timesteps 100000 --learning-starts 1000 --no-cuda --seed 114514 --reward-mode env --reward-frequency 5000`
+- SAC learned：`python casestudy2/sac_continuous_action.py --env-id Reacher-v4 --total-timesteps 100000 --learning-starts 1000 --no-cuda --seed 114514 --reward-mode learned --reward-frequency 5000`
 
-- `runs/Reacher-v4__ppo_continuous_action__env__1__1768646623`
-- `runs/Reacher-v4__ppo_continuous_action__learned__1__1768646658`
-
-SAC（3000 steps，learning_starts=1000，CPU）：
-
-- env：`python casestudy2/sac_continuous_action.py --env-id Reacher-v4 --total-timesteps 3000 --learning-starts 1000 --no-cuda --reward-mode env`
-- learned：`python casestudy2/sac_continuous_action.py --env-id Reacher-v4 --total-timesteps 3000 --learning-starts 1000 --no-cuda --reward-mode learned`
+结果汇总（Reacher-v4, 100k, seed=114514；统计 `mean(last 20 episodes)`）：
 
 | 算法 | reward_mode | mean(last 20 episodes) | max episodic return |
 |---|---|---:|---:|
-| SAC | env | -23.33 | -14.89 |
-| SAC | learned | -44.86 | -34.46 |
+| PPO | env | -37.80 | -25.75 |
+| PPO | learned | -64.34 | -45.34 |
+| SAC | env | -4.79 | -1.50 |
+| SAC | learned | -52.96 | -17.78 |
 
-运行目录：
+运行目录（TensorBoard）：
 
-- `runs/Reacher-v4__sac_continuous_action__env__1__1768646764`
-- `runs/Reacher-v4__sac_continuous_action__learned__1__1768646822`
+- `runs/Reacher-v4__ppo_continuous_action__env__114514__1769277743`
+- `runs/Reacher-v4__ppo_continuous_action__learned__114514__1769278535`
+- `runs/Reacher-v4__sac_continuous_action__env__114514__1769277847`
+- `runs/Reacher-v4__sac_continuous_action__learned__114514__1769278995`
 
-备注：gymnasium 可能会提示 `Reacher-v4` 的 observation dtype/range 警告（float64/float32），但不影响 smoke-run 跑通与记录指标。
+日志目录（stdout/trace）：
 
-多 seed 统计（Reacher-v4, PPO=8192 steps / SAC=3000 steps, seeds=1–5；统计对象为每个 run 的 mean(last 20 episodes)）：
+- `logs/smoke_20260125_seed114514_100k/`
 
-| 算法 | reward_mode | mean over seeds | std over seeds | max episodic return (any seed) |
-|---|---|---:|---:|---:|
-| PPO | env | -58.942 | 0.847 | -45.733 |
-| PPO | learned | -61.587 | 0.590 | -46.637 |
-| SAC | env | -23.464 | 0.793 | -14.885 |
-| SAC | learned | -43.885 | 1.005 | -33.952 |
+简要解读（单 seed）：
 
-进一步的 longer multi-seed（Reacher-v4, PPO=20k / SAC=20k timesteps, seeds=1–5；统计对象为每个 run 的 mean(last 20 episodes)，默认启用 CUDA）：
-
-| 算法 | reward_mode | mean over seeds | std over seeds | max episodic return (any seed) |
-|---|---|---:|---:|---:|
-| PPO | env | -56.569 | 1.631 | -43.084 |
-| PPO | learned | -64.385 | 3.064 | -46.237 |
-| SAC | env | -5.691 | 0.490 | -1.759 |
-| SAC | learned | -50.336 | 9.984 | -20.000 |
-
-简单解读（Reacher 20k）：在本仓库实现与默认超参下，`reward_mode=learned` 明显更差，且在 SAC 上差距非常大；这与论文中“learned reward 提升表现”的直觉不一致，需要后续通过更长 timesteps、严格对齐 reward 模型训练设置/归一化方式来进一步核对。
+- PPO：env 明显好于 learned。
+- SAC：env 显著好于 learned（差距很大）。
 
 ### 4.3 Casestudy3：Data center（离散控制）
 
-说明：该 casestudy 的脚本与其它 case 风格不同（自带 `utils/data_center.py` 环境与 `utils/reward_machine.py` 训练 learned reward）。对比口径仍统一使用 `charts/episodic_return`（环境真实回报）。
+本节已用 **修复后的实现** 重新跑并覆盖（采用“逐个 demo 顺序跑”的方式，避免并行批跑引入的新 bug）。
 
-Smoke-run（seed=1，epochs=5，max_steps=500）：
+运行配置（2026-01-25，seed=114514，近似 100k env steps）：
 
-- DQN env：`python casestudy3/dqn_train.py --reward_mode env --number_epochs 5 --max_steps 500 --seed 1`
-- DQN learned：`python casestudy3/dqn_train.py --reward_mode learned --number_epochs 5 --max_steps 500 --seed 1`
-- PPO env：`python casestudy3/ppo_train.py --reward_mode env --number_epochs 5 --max_steps 500 --seed 1`
-- PPO learned：`python casestudy3/ppo_train.py --reward_mode learned --number_epochs 5 --max_steps 500 --seed 1`
-- SAC env：`python casestudy3/sac_train.py --reward_mode env --number_epochs 5 --max_steps 500 --seed 1`
-- SAC learned：`python casestudy3/sac_train.py --reward_mode learned --number_epochs 5 --max_steps 500 --seed 1`
+- `--number_epochs 9 --max_steps 12000 --steps_per_month 1000`
+  - 解释：每个 epoch 最多 12000 steps，总步数约 $9\times 12000=108000$。
 
-结果汇总（Data center, smoke-run, seed=1）：
+运行命令（每个算法均分别跑 env vs learned；casestudy3 脚本不提供 `--no-cuda`，本次通过 `CUDA_VISIBLE_DEVICES=''` 强制 CPU）：
 
-| 算法 | reward_mode | mean(last 20 episodes) | max episodic return |
-|---|---|---:|---:|
-| DQN | env | 0.216 | 0.393 |
-| DQN | learned | 0.222 | 0.393 |
-| PPO | env | 0.326 | 0.757 |
-| PPO | learned | 0.326 | 0.757 |
-| SAC | env | 0.419 | 0.975 |
-| SAC | learned | 0.522 | 0.930 |
+- DQN env/learned：`python casestudy3/dqn_train.py ... --reward_mode {env,learned}`
+- PPO env/learned：`python casestudy3/ppo_train.py ... --reward_mode {env,learned}`
+- SAC env/learned：`python casestudy3/sac_train.py ... --reward_mode {env,learned}`
 
-运行目录：
+分析口径（强调“整体趋势”，不只看最后几步）：
 
-- `runs/casestudy3__dqn__env__1__1768651181`
-- `runs/casestudy3__dqn__learned__1__1768651189`
-- `runs/casestudy3__ppo__env__1__1768651210`
-- `runs/casestudy3__ppo__learned__1__1768651216`
-- `runs/casestudy3__sac__env__1__1768651272`
-- `runs/casestudy3__sac__learned__1__1768651279`
+- `charts/episodic_return`：环境真实回报（每个 epoch 一条点）。
+- `charts/energy_reduction_rate_clipped`：能耗下降比例（裁剪到 [-1, 1]；每个 epoch 一条点）。
+- 统计方式：用全部曲线点计算 **全程均值（mean_all）**，并对比 **前 20% vs 后 20%** 的均值（粗略反映是否在训练中改善）。
 
-备注（为跑通所做的必要修复）：
-
-- `utils/agent.py` 中 DQN 读取了不存在的 `args.ax_memory/args.discount`（已兼容到 `max_memory/gamma`）。
-- `utils/agent.py` 的 `Categorical` 导入方式错误导致 PPO 报错（已修复）。
-- `utils/agent.py` 的 `SACD_agent` 构造函数与 `casestudy3/sac_train.py` 调用不匹配（已做兼容）。
-- `./model/` 目录缺失导致保存模型失败（已在保存前 `os.makedirs(..., exist_ok=True)` 处理）。
-
-#### 4.3.1 Casestudy3：longer multi-seed（更贴近论文的“跨月份/全年”设定）
-
-论文（PDF）强调评估口径是 **1-year energy consumption reduction rate**（相对 no-AI baseline 的能耗下降比例），而原始脚本默认每步按“分钟”推进：`month = timestep / (30*24*60)`。
-
-问题：如果 `max_steps` 远小于 `30*24*60`，month 不会变化，且 baseline `total_energy_noai` 有时会变成 0（温度恰好一直在舒适区内），会导致 reduction rate 变成极端大负数（分母接近 0）。
-
-因此我做了两点改动来支持“压缩时间”的复现：
-
-- 在 [casestudy3/dqn_train.py](casestudy3/dqn_train.py)、[casestudy3/ppo_train.py](casestudy3/ppo_train.py)、[casestudy3/sac_train.py](casestudy3/sac_train.py) 增加 `--steps_per_month`，并将 month 计算修正为 `(env.initial_month + timestep // steps_per_month) % 12`。
-- 能耗指标：同时记录 `charts/energy_reduction_rate`（raw）与 `charts/energy_reduction_rate_clipped`（裁剪到 [-1, 1]，用于聚合/画图更稳定），以及 `charts/energy_reduction_rate_valid`（baseline 分母是否 > 0）。
-
-scaled-year 运行配置（seeds=1–5，env vs learned，DQN/PPO/SAC）：
-
-- `--number_epochs 10 --max_steps 12000 --steps_per_month 1000`
-  - 解释：把 1000 steps 视为 1 month，因此 12000 steps 覆盖 12 months（“一年”）
-
-结果汇总（统计对象为每个 run 的 mean(last 5 epochs)）：
+结果（casestudy3, seed=114514；前/后 20% 是按 epoch 点数切分）：
 
 环境回报（`charts/episodic_return`）：
 
-| 算法 | reward_mode | mean over seeds | std over seeds | max episodic return (any seed) |
-|---|---|---:|---:|---:|
-| DQN | env | 0.353 | 0.385 | 3.055 |
-| DQN | learned | 0.311 | 0.255 | 3.055 |
-| PPO | env | 0.106 | 0.021 | 3.402 |
-| PPO | learned | 0.106 | 0.021 | 3.402 |
-| SAC | env | 0.250 | 0.229 | 2.665 |
-| SAC | learned | 0.268 | 0.270 | 2.505 |
+| 算法 | reward_mode | mean_all | first20% mean | last20% mean | max |
+|---|---|---:|---:|---:|---:|
+| DQN | env | 0.0247 | 0.1413 | 0.0113 | 0.2225 |
+| DQN | learned | 0.0247 | 0.1413 | 0.0113 | 0.2225 |
+| PPO | env | 0.0941 | 0.0175 | -0.0225 | 0.4650 |
+| PPO | learned | 0.0941 | 0.0175 | -0.0225 | 0.4650 |
+| SAC | env | 0.4789 | 0.0725 | 2.0388 | 3.7350 |
+| SAC | learned | 0.6422 | 0.0725 | 2.7738 | 5.5325 |
 
-能耗下降比例（`charts/energy_reduction_rate_clipped`，裁剪版，用于稳定对比；值越大越省电）：
+能耗下降比例（`charts/energy_reduction_rate_clipped`，越大越省电）：
 
-| 算法 | reward_mode | mean over seeds | std over seeds | max (any seed) |
-|---|---|---:|---:|---:|
-| DQN | env | 0.392 | 0.315 | 1.000 |
-| DQN | learned | 0.261 | 0.244 | 1.000 |
-| PPO | env | -0.090 | 0.148 | 1.000 |
-| PPO | learned | -0.090 | 0.148 | 1.000 |
-| SAC | env | 0.010 | 0.183 | 0.767 |
-| SAC | learned | 0.096 | 0.204 | 0.767 |
+| 算法 | reward_mode | mean_all | first20% mean | last20% mean | max |
+|---|---|---:|---:|---:|---:|
+| DQN | env | -0.3053 | 0.4582 | 0.1294 | 0.5528 |
+| DQN | learned | -0.3053 | 0.4582 | 0.1294 | 0.5528 |
+| PPO | env | -0.2917 | -0.3934 | -1.0000 | 0.6458 |
+| PPO | learned | -0.2917 | -0.3934 | -1.0000 | 0.6458 |
+| SAC | env | 0.0131 | -0.2213 | 0.5514 | 0.5592 |
+| SAC | learned | -0.0218 | -0.2213 | 0.3947 | 0.5574 |
 
-与论文对照（当前可得结论）：
+简要趋势解读（单 seed，epoch 数较少，结论偏“demo 排雷”性质）：
 
-- 本仓库 casestudy3 的环境/基线设定会出现 `total_energy_noai=0` 的 epoch（舒适区内无需能耗），导致 raw reduction rate 不稳定；这与论文“全年能耗对比”的设定不完全一致。
-- 在“压缩时间 + 裁剪指标”的设置下，learned reward 并没有稳定地在所有算法上带来更高的能耗下降；例如 DQN 下 env 反而更高，SAC 下 learned 略高但方差不小。
-- 若要严格对齐论文的 200 rounds、每分钟决策、全年统计，需要把每个 epoch 的步数拉到 50 万级（12*30*24*60），这个计算量在本机上会非常大；当前结论应视为“按原环境动力学压缩时间尺度”的近似复现。
+- DQN/PPO：env 与 learned 的两条曲线在本次配置下几乎一致（回报与能耗指标都一致），说明 reward_mode 切换在该短预算下没有带来可观察的行为差异（需要再拉长 epochs 或进一步检查训练代码是否真正用到了 reward_train）。
+- SAC：learned 的环境回报整体更高（mean_all 与 max 更高，后 20% 明显上升），但能耗下降指标反而略差（env 的 mean_all 略正，learned 略负）。这提示 learned reward 在此 case 中可能更偏向“任务回报”，未必直接优化能耗指标。
+
+本次趋势分析原始输出（可复核）：
+
+- `logs/smoke_20260125_seed114514_100k/trend_case3_episodic_return.tsv`
+- `logs/smoke_20260125_seed114514_100k/trend_case3_energy_reduction_rate_clipped.tsv`
 
 ### 4.4 Casestudy4：PyFlyt/QuadX-Waypoints-v4（UAV 连续控制）
 
-依赖与环境包装：
+本节同样以 **修复后** 的 100k 单 seed（顺序跑）结果为准。
 
-- 安装了 `pyflyt` / `pybullet`。
-- PyFlyt 会带入 `pettingzoo`，而 pettingzoo 期望更高版本 `gymnasium`（>=1.0.0）。为兼容 `stable-baselines3==2.0.0`（要求 `gymnasium==0.28.1`），本环境保持 gymnasium 0.28.1，因此 pip 会提示依赖冲突；但实际 `PyFlyt/QuadX-Waypoints-v4` 仍可运行。
-- Waypoints 原始 observation 结构较复杂，脚本使用 `FlattenWaypointEnv(context_length=2)` 进行扁平化以适配 MLP。
+运行配置（2026-01-25，CPU，seed=114514，100k steps；逐个 demo 顺序跑）：
 
-SAC（2000 steps，learning_starts=1000，CPU）：
+- PPO：`python casestudy4/ppo_continuous_action.py --total-timesteps 100000 --reward-mode {env,learned} --reward-frequency 5000 --no-cuda --seed 114514`
+- SAC：`python casestudy4/sac_continuous_action.py --total-timesteps 100000 --learning-starts 1000 --reward-mode {env,learned} --reward-frequency 5000 --no-cuda --seed 114514`
+- TD3：`python casestudy4/td3_continuous_action.py --total-timesteps 100000 --learning-starts 1000 --reward-mode {env,learned} --reward-frequency 5000 --no-cuda --seed 114514`
 
-- env：`python casestudy4/sac_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps 2000 --learning-starts 1000 --no-cuda --seed 1 --reward-mode env`
-- learned：`python casestudy4/sac_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps 2000 --learning-starts 1000 --no-cuda --seed 1 --reward-mode learned`
+分析口径：使用 `charts/episodic_return`（环境回报），并用 **全程均值 + 前/后 20% 均值** 来看整体趋势（而不是只看最后 20 个 episode）。
 
-| 算法 | reward_mode | mean(last 20 episodes) | max episodic return |
-|---|---|---:|---:|
-| SAC | env | -100.97 | 9.73 |
-| SAC | learned | -103.95 | 9.73 |
+整体趋势结果（PyFlyt/QuadX-Waypoints-v4, 100k, seed=114514）：
 
-运行目录：
+| 算法 | reward_mode | mean_all | first20% mean | last20% mean | max |
+|---|---|---:|---:|---:|---:|
+| PPO | env | -35.49 | -91.74 | 16.66 | 177.63 |
+| PPO | learned | -93.82 | -93.53 | -95.03 | 112.54 |
+| SAC | env | -34.23 | -85.55 | -12.30 | 294.38 |
+| SAC | learned | -93.44 | -78.78 | -102.17 | 92.48 |
+| TD3 | env | -17.50 | -98.85 | 27.49 | 270.83 |
+| TD3 | learned | -93.26 | -103.31 | -54.74 | 111.16 |
 
-- `runs/PyFlyt/QuadX-Waypoints-v4__sac_continuous_action__env__1__1768648320`
-- `runs/PyFlyt/QuadX-Waypoints-v4__sac_continuous_action__learned__1__1768648343`
+简要趋势解读（单 seed，但 episode 数量很大，趋势更可信）：
 
-PPO（4096 steps，CPU）：
+- env：三种算法都呈现明显“从负到接近 0 甚至转正”的改善趋势（first20% 很差，last20% 明显更高）。
+- learned：PPO/SAC 的整体曲线基本卡在 -90 左右（first20% 与 last20% 接近甚至变差），表现显著弱于 env。
+- TD3 learned 虽然 last20% 比 first20% 好，但 mean_all 仍非常低（整体大部分时间在低回报区间）。
 
-- env：`python casestudy4/ppo_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps 4096 --num-envs 1 --num-steps 128 --no-cuda --seed 1 --reward-mode env`
-- learned：`python casestudy4/ppo_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps 4096 --num-envs 1 --num-steps 128 --no-cuda --seed 1 --reward-mode learned`
+本次趋势分析原始输出（可复核）：
 
-| 算法 | reward_mode | mean(last 20 episodes) | max episodic return |
-|---|---|---:|---:|
-| PPO | env | -96.11 | 12.61 |
-| PPO | learned | -94.64 | 11.32 |
+- `logs/smoke_20260125_seed114514_100k/trend_case4_episodic_return.tsv`
+- 顺序跑 driver log：`logs/smoke_20260125_seed114514_100k/driver_case3_case4_sequential.log`
 
-运行目录：
-
-- `runs/PyFlyt/QuadX-Waypoints-v4__ppo_continuous_action__env__1__1768648446`
-- `runs/PyFlyt/QuadX-Waypoints-v4__ppo_continuous_action__learned__1__1768648564`
-
-TD3（2000 steps，learning_starts=1000，CPU）：
-
-- env：`python casestudy4/td3_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps 2000 --learning-starts 1000 --no-cuda --seed 1 --reward-mode env`
-- learned：`python casestudy4/td3_continuous_action.py --env-id PyFlyt/QuadX-Waypoints-v4 --total-timesteps 2000 --learning-starts 1000 --no-cuda --seed 1 --reward-mode learned`
-
-| 算法 | reward_mode | mean(last 20 episodes) | max episodic return |
-|---|---|---:|---:|
-| TD3 | env | -102.09 | 9.73 |
-| TD3 | learned | -98.04 | 9.73 |
-
-运行目录：
-
-- `runs/PyFlyt/QuadX-Waypoints-v4__td3_continuous_action__env__1__1768648737`
-- `runs/PyFlyt/QuadX-Waypoints-v4__td3_continuous_action__learned__1__1768648834`
-
-多 seed 统计（PyFlyt/QuadX-Waypoints-v4, SAC/TD3=2000 steps / PPO=4096 steps, seeds=1–5；统计对象为每个 run 的 mean(last 20 episodes)）：
-
-| 算法 | reward_mode | mean over seeds | std over seeds | max episodic return (any seed) |
-|---|---|---:|---:|---:|
-| SAC | env | -100.930 | 3.129 | 12.947 |
-| SAC | learned | -102.058 | 1.500 | 12.947 |
-| PPO | env | -97.016 | 3.662 | 18.722 |
-| PPO | learned | -97.380 | 2.065 | 14.330 |
-| TD3 | env | -101.536 | 1.551 | 12.947 |
-| TD3 | learned | -100.065 | 1.644 | 12.947 |
-
-进一步的 longer multi-seed（PyFlyt/QuadX-Waypoints-v4, PPO/SAC/TD3=2000 timesteps, seeds=1–5；统计对象为每个 run 的 mean(last 20 episodes)，默认启用 CUDA）：
-
-| 算法 | reward_mode | mean over seeds | std over seeds | max episodic return (any seed) |
-|---|---|---:|---:|---:|
-| PPO | env | -95.002 | 2.629 | 15.916 |
-| PPO | learned | -87.039 | 26.914 | 10.734 |
-| SAC | env | -100.352 | 2.700 | 12.947 |
-| SAC | learned | -88.737 | 22.011 | 15.014 |
-| TD3 | env | -102.243 | 2.305 | 12.947 |
-| TD3 | learned | -101.732 | 3.386 | 12.947 |
-
-简单解读（PyFlyt 2k）：从均值看 PPO/SAC 的 learned reward 更高（更接近 0），但方差明显更大（不稳定）；TD3 基本持平。这个结论仍属于“短预算验证”，需要更长 timesteps 才能对齐论文的稳定提升叙事。
-
-## 5. “是否有 trick/造假”检查结论（当前能覆盖范围）
+## 5. “是否有 trick”检查结论（当前能覆盖范围）
 
 - 从对比口径看：env vs learned 的比较使用同一个环境真实回报指标（`charts/episodic_return`），没有出现“用 learned reward 指标冒充环境成绩”的情况。
 - 从实验设置看：seed 与超参在同一算法内保持一致，主要差异仅是 reward_mode。

@@ -208,12 +208,16 @@ class RewardFunction():
             states_batch.append(np.asarray(s))
             overline_V_batch.append(float(overline_V))
 
-        self.optimize_value_function(np.asarray(states_batch), np.asarray(overline_V_batch))
-
+        # Update reward model first.
+        # Some training loops call this alongside other model updates; doing the reward step
+        # before value-function regression avoids accidental inplace-version conflicts.
         loss = torch.mean(torch.stack(losses))
         self.reward_function_optimizer.zero_grad()
         loss.backward()
         self.reward_function_optimizer.step()
+
+        # Then regress value function V(s) toward overline_V.
+        self.optimize_value_function(np.asarray(states_batch), np.asarray(overline_V_batch))
 
     def optimize_value_function(self, states_batch, overline_V_batch):
         """
