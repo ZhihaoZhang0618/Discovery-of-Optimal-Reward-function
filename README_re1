@@ -1,0 +1,11 @@
+1. 传统PPO（使用环境奖励）
+ python ppo_re1.py --reward_mode env --seed 1
+
+
+2. 学习奖励函数的PPO
+
+ python ppo_re1.py --reward_mode learned --reward_frequency 8192 --reward_lr 1e-5 --freeze_reward_after 0 --seed 1
+
+ or
+
+ python ppo_re1.py --reward_mode learned --reward_frequency 4096 --reward_lr 1e-5 --freeze_reward_after 0 --seed 1
